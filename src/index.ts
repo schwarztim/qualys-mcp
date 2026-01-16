@@ -9,6 +9,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance, AxiosError } from "axios";
 import { parseStringPromise } from "xml2js";
+import http from "http";
+import https from "https";
 
 // Environment variables for configuration
 const QUALYS_API_URL = process.env.QUALYS_API_URL || "https://qualysapi.qualys.com";
@@ -19,19 +21,52 @@ const QUALYS_PASSWORD = process.env.QUALYS_PASSWORD || "";
 const RATE_LIMIT_DELAY_MS = 1000; // 1 second between requests
 let lastRequestTime = 0;
 
-// Create axios instance with authentication
-function createApiClient(): AxiosInstance {
-  const auth = Buffer.from(`${QUALYS_USERNAME}:${QUALYS_PASSWORD}`).toString("base64");
+// Singleton HTTP client with connection pooling
+let apiClient: AxiosInstance | null = null;
+let cachedAuthHeader: string | null = null;
 
-  return axios.create({
+// HTTP agents for connection pooling (reuse connections)
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000, // Keep connections alive for 30 seconds
+  maxSockets: 10, // Allow up to 10 concurrent connections
+  maxFreeSockets: 5, // Keep up to 5 idle connections
+});
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 10,
+  maxFreeSockets: 5,
+});
+
+// Create axios instance with authentication and connection pooling (singleton pattern)
+function getApiClient(): AxiosInstance {
+  // Return cached client if already created
+  if (apiClient) {
+    return apiClient;
+  }
+
+  // Cache the auth header to avoid re-computing Base64 encoding on every call
+  if (!cachedAuthHeader && QUALYS_USERNAME && QUALYS_PASSWORD) {
+    cachedAuthHeader = `Basic ${Buffer.from(`${QUALYS_USERNAME}:${QUALYS_PASSWORD}`).toString("base64")}`;
+  }
+
+  // Create client with HTTP connection pooling enabled
+  apiClient = axios.create({
     baseURL: QUALYS_API_URL,
     headers: {
-      "Authorization": `Basic ${auth}`,
+      "Authorization": cachedAuthHeader || "",
       "X-Requested-With": "qualys-mcp",
       "Content-Type": "application/x-www-form-urlencoded",
     },
     timeout: 120000, // 2 minutes timeout for long-running requests
+    // Enable HTTP keep-alive for connection pooling (significant performance improvement)
+    httpAgent,
+    httpsAgent,
   });
+
+  return apiClient;
 }
 
 // Rate limiting helper
@@ -161,6 +196,15 @@ const tools: Tool[] = [
           type: "string",
           enum: ["Confirmed", "Potential"],
           description: "Filter by vulnerability type",
+        },
+        arf_filter_keys: {
+          type: "string",
+          description: "Advanced Remediation Filters (2024+): non-running-kernel, non-running-service, config-not-exploitable (comma-separated)",
+        },
+        show_epss: {
+          type: "boolean",
+          description: "Include EPSS (Exploit Prediction Scoring System) scores (2024+ feature)",
+          default: false,
         },
       },
     },
@@ -389,13 +433,21 @@ const tools: Tool[] = [
   },
   {
     name: "qualys_get_knowledgebase",
-    description: "Search the Qualys KnowledgeBase for vulnerability information by QID.",
+    description: "Search the Qualys KnowledgeBase for vulnerability information by QID or CVE.",
     inputSchema: {
       type: "object",
       properties: {
         ids: {
           type: "string",
           description: "Filter by QIDs (comma-separated or ranges like 1-100)",
+        },
+        id_min: {
+          type: "string",
+          description: "Minimum QID in range",
+        },
+        id_max: {
+          type: "string",
+          description: "Maximum QID in range",
         },
         details: {
           type: "string",
@@ -407,9 +459,67 @@ const tools: Tool[] = [
           type: "string",
           description: "Filter by last modified date (YYYY-MM-DD)",
         },
+        last_modified_before: {
+          type: "string",
+          description: "Filter by last modified before date (YYYY-MM-DD)",
+        },
         published_after: {
           type: "string",
           description: "Filter by publish date (YYYY-MM-DD)",
+        },
+        published_before: {
+          type: "string",
+          description: "Filter by publish before date (YYYY-MM-DD)",
+        },
+        show_qds: {
+          type: "boolean",
+          description: "Include Qualys Detection Score (QDS) information",
+          default: false,
+        },
+        show_qds_factors: {
+          type: "boolean",
+          description: "Include QDS contributing factors (EPSS, MITRE ATT&CK, etc.)",
+          default: false,
+        },
+        show_pci_reasons: {
+          type: "boolean",
+          description: "Show PCI compliance failure reasons",
+          default: false,
+        },
+      },
+    },
+  },
+  {
+    name: "qualys_get_knowledgebase_by_cve",
+    description: "Search Qualys KnowledgeBase by CVE ID (2024+ feature). Supports QVS score filtering.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cve_ids: {
+          type: "string",
+          description: "CVE IDs to search (comma-separated, e.g., CVE-2024-1234,CVE-2024-5678)",
+        },
+        qvs_min: {
+          type: "number",
+          description: "Minimum QVS (Qualys Vulnerability Score) to filter (0-100)",
+        },
+        qvs_max: {
+          type: "number",
+          description: "Maximum QVS to filter (0-100)",
+        },
+        last_modified_within_days: {
+          type: "number",
+          description: "Get CVEs with QVS scores modified in last N days (e.g., 15 for recent updates)",
+        },
+        show_qds: {
+          type: "boolean",
+          description: "Include QDS information",
+          default: true,
+        },
+        show_qds_factors: {
+          type: "boolean",
+          description: "Include QDS factors (EPSS, MITRE, CISA KEV)",
+          default: false,
         },
       },
     },
@@ -487,12 +597,36 @@ const tools: Tool[] = [
   },
 ];
 
+// Check if credentials are configured
+function checkCredentials(): string | null {
+  if (!QUALYS_USERNAME || !QUALYS_PASSWORD) {
+    return "Qualys credentials not configured. Please set the following environment variables:\n" +
+      "  - QUALYS_USERNAME: Your Qualys username\n" +
+      "  - QUALYS_PASSWORD: Your Qualys password\n" +
+      "  - QUALYS_API_URL: (optional) Your Qualys API URL (defaults to https://qualysapi.qualys.com)";
+  }
+  return null;
+}
+
 // Tool handlers
 async function handleToolCall(
   name: string,
   args: Record<string, unknown>
 ): Promise<{ content: Array<{ type: string; text: string }> }> {
-  const client = createApiClient();
+  // Check credentials before making any API calls
+  const credentialError = checkCredentials();
+  if (credentialError) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Error: ${credentialError}`,
+        },
+      ],
+    };
+  }
+
+  const client = getApiClient();
 
   try {
     let response;
@@ -527,6 +661,8 @@ async function handleToolCall(
           truncation_limit: args.truncation_limit as number || 100,
           show_igs: args.show_igs ? "1" : "0",
           include_vuln_type: args.include_vuln_type as string,
+          arf_filter_keys: args.arf_filter_keys as string,
+          show_epss: args.show_epss ? "1" : "0",
         });
         response = await rateLimitedRequest(() =>
           client.post("/api/2.0/fo/asset/host/vm/detection/", params)
@@ -714,10 +850,48 @@ async function handleToolCall(
         const params = buildFormData({
           action: "list",
           ids: args.ids as string,
+          id_min: args.id_min as string,
+          id_max: args.id_max as string,
           details: args.details as string || "Basic",
           last_modified_after: args.last_modified_after as string,
+          last_modified_before: args.last_modified_before as string,
           published_after: args.published_after as string,
+          published_before: args.published_before as string,
+          show_qds: args.show_qds ? "1" : "0",
+          show_qds_factors: args.show_qds_factors ? "1" : "0",
+          show_pci_reasons: args.show_pci_reasons ? "1" : "0",
         });
+        response = await rateLimitedRequest(() =>
+          client.post("/api/2.0/fo/knowledge_base/vuln/", params)
+        );
+        result = await parseXmlResponse(response.data);
+        break;
+      }
+
+      case "qualys_get_knowledgebase_by_cve": {
+        // Build params for CVE-based search
+        const cveParams: Record<string, string | number | boolean | undefined> = {
+          action: "list",
+        };
+
+        if (args.cve_ids) {
+          cveParams.cve_id = args.cve_ids as string;
+        }
+        if (args.qvs_min !== undefined) {
+          cveParams.qvs_min = args.qvs_min as number;
+        }
+        if (args.qvs_max !== undefined) {
+          cveParams.qvs_max = args.qvs_max as number;
+        }
+        if (args.last_modified_within_days) {
+          const date = new Date();
+          date.setDate(date.getDate() - (args.last_modified_within_days as number));
+          cveParams.last_modified_after = date.toISOString().split('T')[0];
+        }
+        cveParams.show_qds = args.show_qds !== false ? "1" : "0";
+        cveParams.show_qds_factors = args.show_qds_factors ? "1" : "0";
+
+        const params = buildFormData(cveParams);
         response = await rateLimitedRequest(() =>
           client.post("/api/2.0/fo/knowledge_base/vuln/", params)
         );
@@ -809,11 +983,6 @@ async function handleToolCall(
 
 // Main server setup
 async function main(): Promise<void> {
-  // Validate required environment variables
-  if (!QUALYS_USERNAME || !QUALYS_PASSWORD) {
-    console.error("Warning: QUALYS_USERNAME and QUALYS_PASSWORD environment variables are required for API access.");
-  }
-
   const server = new Server(
     {
       name: "qualys-mcp",
